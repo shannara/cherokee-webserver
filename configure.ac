@@ -29,7 +29,7 @@ m4_define([cherokee_micro_version], [104])
 m4_define([cherokee_version], m4_format('%s.%s.%s', cherokee_major_version, cherokee_minor_version, cherokee_micro_version))
 
 dnl Init autoconf and automake
-AC_INIT([cherokee],[cherokee_version],[https://github.com/cherokee/webserver/issues],[cherokee])
+AC_INIT([cherokee], [cherokee_version], [https://github.com/cherokee/webserver/issues], [cherokee])
 AC_CONFIG_SRCDIR([cherokee/server.c])
 AC_CONFIG_MACRO_DIR([m4])
 AM_INIT_AUTOMAKE([no-define])
@@ -204,13 +204,14 @@ AC_SUBST(VERSION)
 
 dnl Paths
 AC_PROG_CC
+AC_PROG_CC_STDC
 AC_PROG_CXX
 AC_PROG_INSTALL
 AC_PROG_MAKE_SET
 AC_PROG_YACC
-AC_PROG_LEX(noyywrap)
+AC_PROG_LEX
 AC_PROG_LN_S
-LT_INIT(dlopen)
+AM_PROG_LIBTOOL
 
 AC_PATH_PROG(cherokeepath, cherokee)
 
@@ -1064,28 +1065,100 @@ AC_ARG_WITH(libssl,
 have_openssl=no
 
 if test "$WITH_OPENSSL" != "no"; then
+    dnl backup the pre-ssl variables
+    CLEANLDFLAGS="$LDFLAGS"
+    CLEANCFLAGS="$CFLAGS"
+    CLEANLIBS="$LIBS"
     if test "$WITH_OPENSSL" != "yes"; then
-        LIBSSL_CFLAGS="-I$WITH_OPENSSL/include"
+        LIBSSL_CFLAGS="-I$WITH_OPENSSL/include -I$WITH_OPENSSL/include/openssl"
         LIBSSL_LIBS="-L$WITH_OPENSSL/lib"
+        LIBCRYPTO_LIBS="-L$WITH_OPENSSL/lib"
+        OPENSSL_PATH="$WITH_OPENSSL/bin"
     fi
 
-    AC_CHECK_LIB(crypto, BN_init)
-    AC_CHECK_HEADERS([openssl/engine.h])
-    AC_CHECK_LIB(ssl, SSL_accept, [have_openssl=yes], [have_openssl=no], $LIBSSL_LIBS)
+    CFLAGS="$CFLAGS $LIBSSL_CFLAGS"
+    LDFLAGS="$LDFLAGS $LIBSSL_LIBS"
+
+    AC_CHECK_LIB(crypto, CRYPTO_new_ex_data, [], [AC_MSG_ERROR([library 'crypto' is required for OpenSSL])])
+    have_openssl="no"
+    AC_CHECK_LIB(ssl, OPENSSL_init_ssl, [have_openssl="yes"])
+    AC_CHECK_LIB(ssl, SSL_library_init, [have_openssl="yes"])
+    AC_CHECK_LIB(ssl, SSL_accept, [have_openssl=yes])
 
     if test "$have_openssl" = "yes"; then
-        LIBSSL_LIBS="$LIBSSL_LIBS -lssl"
-
-	   AC_SUBST(LIBSSL_LIBS)
-	   AC_SUBST(LIBSSL_CFLAGS)
-
-	   AC_DEFINE(HAVE_OPENSSL, 1, [Have OpenSSL library])
-	   AC_PATH_PROG([OPENSSL_BIN], [openssl])
-	   AC_SUBST(OPENSSL_BIN)
+        AC_CHECK_HEADERS(openssl/dh.h openssl/rand.h openssl/crypto.h \
+                         openssl/lhash.h openssl/ssl.h openssl/err.h,
+                         AC_DEFINE(HAVE_OPENSSL, 1, [Have OpenSSL/libssl library]),
+                         have_openssl="no"
+                        )
     fi
+    AS_IF([test "x$have_openssl" = xno], [AC_MSG_ERROR([library 'ssl' is required for OpenSSL])])
+
+    if test "$have_openssl" = "yes"; then
+        TLS_BACK_END="OpenSSL/libssl"
+        OPENSSL_PATH="$OPENSSL_PATH$PATH_SEPARATOR$PATH"
+        LIBSSL_LIBS="$LIBSSL_LIBS -lssl -lcrypto"
+
+        AC_SUBST(LIBSSL_LIBS)
+        AC_SUBST(LIBSSL_CFLAGS)
+
+        AC_CACHE_CHECK([for a suitable test server to verify $TLS_BACK_END TLS protocol support], [ac_cv_path_OPENSSL_BIN],
+                [AC_PATH_PROGS_FEATURE_CHECK([OPENSSL_BIN], [openssl],
+                  [v=$($ac_path_OPENSSL_BIN s_server -help 2>&1)
+                   if test $? -eq 0 || [[[ $v == unknown* ]]]; then
+                     TLS_PROTOCOLS=$(echo $v | grep -Eoe '-(ssl|tls)[[0-9]]+[[_]]*[[0-9]]*' | tr '\n' ',' | sed 's/.$//' | sed 's/-//g')
+                     ac_cv_path_OPENSSL_BIN="$ac_path_OPENSSL_BIN" ac_path_OPENSSL_BIN_found=:
+                   fi],,
+                  $OPENSSL_PATH)])
+        AC_SUBST(OPENSSL_BIN, [$ac_cv_path_OPENSSL_BIN])
+
+        AC_SUBST(OPENSSL_TLS_PROTOCOLS, [])
+        if test -n "$ac_cv_path_OPENSSL_BIN"; then
+          AC_DEFINE_UNQUOTED(PATH_OPENSSL_BIN, ["$ac_cv_path_OPENSSL_BIN"], [Define path to OpenSSL command-line tool])
+          AC_MSG_CHECKING([for $TLS_BACK_END supported SSL/TLS protocols])
+          AC_DEFINE_UNQUOTED(TLS_BACK_END_PROTOCOL_VERSIONS, ["$TLS_PROTOCOLS"], [Define TLS protocols supported by OpenSSL/libssl])
+          AC_SUBST(OPENSSL_TLS_PROTOCOLS, ["$TLS_PROTOCOLS"])
+          AC_MSG_RESULT($TLS_PROTOCOLS)
+        fi
+
+        AC_MSG_CHECKING([if Cherokee supports all OpenSSL SSL/TLS protocol versions])
+        AC_RUN_IFELSE([AC_LANG_PROGRAM([#include <openssl/ssl.h>],
+                                       [#ifdef TLS_MAX_VERSION
+                                        int max = TLS_MAX_VERSION;
+                                        #ifdef TLS1_3_VERSION
+                                        if (max > TLS1_3_VERSION) exit(1);
+                                        #else
+                                        if (max > 0x0304) exit(1);
+                                        #endif
+                                        #endif])],
+                      [AC_MSG_RESULT(yes)],
+                      [AC_MSG_RESULT(no)
+                       AC_MSG_ERROR([
+*** OpenSSL supports more recent versions of SSL/TLS protocols, which are not recognized by Cherokee.
+*** Please check for the latest Cherokee source or update Cherokee source code.])])
+
+	AC_SUBST(USE_OPENSSL_MIN_MAX_PROTOCOL, [False])
+        AC_MSG_CHECKING([for SSL_CTX_get_min_proto_version() in $TLS_BACK_END])
+	AC_RUN_IFELSE([AC_LANG_PROGRAM([#include <openssl/ssl.h>],
+                                       [#ifndef SSL_CTRL_GET_MIN_PROTO_VERSION
+                                        exit(1);
+                                        #endif])],
+                      [AC_MSG_RESULT(yes)
+                       AC_DEFINE(HAVE_SSL_CTX_GET_MIN_PROTO_VERSION, [1], [OpenSSL/libssl has SSL_CTX_get_min_proto_version() function])
+                       AC_SUBST(USE_OPENSSL_MIN_MAX_PROTOCOL, [True])],
+                      [AC_MSG_RESULT(no)])
+
+        AC_CHECK_LIB(ssl, SSL_CTX_set_ciphersuites, [have_openssl_ciphersuites=yes], [have_openssl_ciphersuites=no])
+        if test "$have_openssl_ciphersuites" = "yes"; then
+            AC_DEFINE(HAVE_SSL_CTX_SET_CIPHERSUITES, 1, [OpenSSL/libssl has SSL_CTX_set_ciphersuites() function])
+        fi
+
+        AC_CHECK_HEADERS([openssl/engine.h])
+    fi
+    # restore CFLAGS and LDFLAGS
+    CFLAGS="${CLEANCFLAGS}"
+    LDFLAGS="${CLEANLDFLAGS}"
 fi
-AC_MSG_CHECKING(for libssl)
-AC_MSG_RESULT([$have_openssl])
 
 AM_CONDITIONAL(USE_OPENSSL, test "x$have_openssl" = "xyes")
 
@@ -1249,6 +1322,7 @@ AC_ARG_WITH(wwwroot, AS_HELP_STRING([--with-wwwroot=DIR],[Set the WWW root direc
 	   WWW_ROOT="$localstatedir/www"
    fi
 ])
+AC_DEFINE_UNQUOTED(WWW_ROOT, "$WWW_ROOT", [WWW root directory])
 AC_SUBST(WWW_ROOT)
 
 AC_ARG_WITH(cgiroot, AS_HELP_STRING([--with-cgiroot=DIR],[Set the CGI directory]),
